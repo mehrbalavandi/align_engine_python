@@ -13,15 +13,29 @@ For every (audio, text) pair found in the input folders, this script:
 
 USAGE
 -----
-    python align_batch.py --audio_dir audio --text_dir text --out_dir output
+    python align_batch.py
 
-Folder layout expected:
-    audio/MindsetIELTS_L3_09.mp3
-    text/MindsetIELTS_L3_09.txt      (same stem, exact transcript, no markers)
+By default, everything lives in ONE folder called "share", sitting right
+next to this script — no arguments needed. Put your audio files and their
+matching text/.docx transcripts (same filename stem) together in there:
+
+    align_engine/
+      align_batch.py
+      share/
+        MindsetIELTS_L3_09.mp3
+        MindsetIELTS_L3_09.docx      (or .txt — same stem, no markers)
+        output/                       <- created automatically
+          MindsetIELTS_L3_09_markers.txt
+          MindsetIELTS_L3_09_draft.json
+
+If you'd rather keep audio/text/output in separate folders (the old
+layout), pass --audio_dir / --text_dir / --out_dir to override any of
+them individually — anything you don't override still falls back to
+the "share" folder (or "share/output" for the output).
 
 Output:
-    output/MindsetIELTS_L3_09_markers.txt   <- paste into Word
-    output/MindsetIELTS_L3_09_draft.json    <- open in the WPF review tool
+    <out_dir>/<stem>_markers.txt   <- paste into Word
+    <out_dir>/<stem>_draft.json    <- open in the WPF review tool
 
 See README.md in this folder for installation (ffmpeg + pip) and important
 notes on the alignment model's license.
@@ -46,6 +60,44 @@ from ctc_forced_aligner import (
 )
 
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+SCRIPT_EXTS = (".docx", ".txt")  # checked in this order — .docx preferred when both exist
+
+
+# ---------------------------------------------------------------------------
+# Reading the script text: either a plain .txt, or the same two-row Word
+# table (AudioTrackName row + script row) that AudioMarkerReview and
+# CustomLayoutGenerator both read — so you only maintain ONE source file
+# per audio, not a .docx plus a hand-kept-in-sync .txt.
+# ---------------------------------------------------------------------------
+
+def read_docx_script_text(docx_path: Path) -> str:
+    """Extracts row[1]'s plain text from the first qualifying 2-row table
+    (non-empty row[0] = AudioTrackName) in the .docx, exactly mirroring the
+    table CustomLayoutGenerator/AudioMarkerReview locate. Only the FIRST
+    matching table is used — split multi-track docs into one file per
+    track if you need more than that.
+    """
+    import docx  # python-docx
+
+    document = docx.Document(str(docx_path))
+    for table in document.tables:
+        if len(table.rows) < 2:
+            continue
+        track_name = table.rows[0].cells[0].text.strip()
+        if not track_name:
+            continue
+        parts = []
+        for cell in table.rows[1].cells:
+            for para in cell.paragraphs:
+                parts.append(para.text)
+        return "\n".join(parts)
+    raise ValueError(f"No 2-row table with a non-empty first row found in {docx_path.name}")
+
+
+def read_script_text(text_path: Path) -> str:
+    if text_path.suffix.lower() == ".docx":
+        return read_docx_script_text(text_path)
+    return text_path.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +112,7 @@ def align_one(model, tokenizer, audio_path: Path, text_path: Path, language: str
     exact order they appear in the text (so index i of `results` always
     corresponds to word i of `original_text.split()`).
     """
-    original_text = text_path.read_text(encoding="utf-8")
+    original_text = read_script_text(text_path)
     # The library itself collapses newlines to spaces internally before
     # splitting on whitespace for alignment purposes — we keep our own copy
     # of the untouched original_text so we can restore real line breaks later.
@@ -149,20 +201,32 @@ def find_pairs(audio_dir: Path, text_dir: Path):
     for audio_path in sorted(audio_dir.iterdir()):
         if audio_path.suffix.lower() not in AUDIO_EXTS:
             continue
-        text_path = text_dir / f"{audio_path.stem}.txt"
-        if text_path.exists():
+        text_path = None
+        for ext in SCRIPT_EXTS:
+            candidate = text_dir / f"{audio_path.stem}{ext}"
+            if candidate.exists():
+                text_path = candidate
+                break
+        if text_path is not None:
             pairs.append((audio_path, text_path))
         else:
-            print(f"  [skip] no matching text file for {audio_path.name} "
-                  f"(expected {text_path.name})", file=sys.stderr)
+            print(f"  [skip] no matching .docx or .txt for {audio_path.name} "
+                  f"(expected {audio_path.stem}.docx or {audio_path.stem}.txt)", file=sys.stderr)
     return pairs
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--audio_dir", required=True, type=Path)
-    ap.add_argument("--text_dir", required=True, type=Path)
-    ap.add_argument("--out_dir", required=True, type=Path)
+    ap.add_argument("--share_dir", type=Path, default=None,
+                     help="Single folder holding BOTH audio and text/.docx files, matched by "
+                          "filename stem. Defaults to a 'share' folder next to this script. "
+                          "Outputs go to <share_dir>/output unless --out_dir overrides it.")
+    ap.add_argument("--audio_dir", type=Path, default=None,
+                     help="Override: use a separate folder for audio instead of --share_dir.")
+    ap.add_argument("--text_dir", type=Path, default=None,
+                     help="Override: use a separate folder for text/.docx instead of --share_dir.")
+    ap.add_argument("--out_dir", type=Path, default=None,
+                     help="Override: write outputs somewhere other than <share_dir>/output.")
     ap.add_argument("--language", default="eng", help="ISO 639-3 code (default: eng)")
     ap.add_argument("--granularity", choices=["word", "sentence"], default="word",
                      help="word = a marker after every word (default); "
@@ -176,9 +240,22 @@ def main():
                           "CC-BY-NC-4.0 licensed (non-commercial) — see README.md")
     args = ap.parse_args()
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    script_dir = Path(__file__).resolve().parent
+    share_dir = args.share_dir or (script_dir / "share")
+    audio_dir = args.audio_dir or share_dir
+    text_dir = args.text_dir or share_dir
+    out_dir = args.out_dir or (share_dir / "output")
 
-    pairs = find_pairs(args.audio_dir, args.text_dir)
+    for label, d in (("audio", audio_dir), ("text", text_dir)):
+        if not d.exists():
+            print(f"{label.capitalize()} folder not found: {d}\n"
+                  f"Create it and put your audio + matching text/.docx files inside "
+                  f"(same filename stem for each pair), then re-run.", file=sys.stderr)
+            sys.exit(1)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pairs = find_pairs(audio_dir, text_dir)
     if not pairs:
         print("No matching (audio, text) pairs found.", file=sys.stderr)
         sys.exit(1)
@@ -220,14 +297,14 @@ def main():
                 marker_text = "".join(out)
 
             stem = audio_path.stem
-            (args.out_dir / f"{stem}_markers.txt").write_text(marker_text, encoding="utf-8")
+            (out_dir / f"{stem}_markers.txt").write_text(marker_text, encoding="utf-8")
             draft = {
                 "audioFile": audio_path.name,
                 "words": words,
                 "boundariesMs": boundaries_ms,
                 "scores": scores,
             }
-            (args.out_dir / f"{stem}_draft.json").write_text(
+            (out_dir / f"{stem}_draft.json").write_text(
                 json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             low_conf = sum(1 for s in scores if s < -1.5)
