@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+
+# generated per-run outputs — remove this line if you'd rather version them too
+output/
