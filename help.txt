@@ -1,0 +1,2 @@
+python align_batch.py --audio_dir audio --text_dir text --out_dir output
+به دستور بالا احتیاجی نیست و فقط با زدن اف 5 برنامه را اجراء کنید.
