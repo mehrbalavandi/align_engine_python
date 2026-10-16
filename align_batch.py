@@ -65,9 +65,30 @@ def save_config(cfg: dict) -> None:
 # listing tracks and --dry-run start instantly)
 # ---------------------------------------------------------------------------
 
+def is_out_of_memory(e: BaseException) -> bool:
+    """RAM/VRAM ran out while running the model (CPU: "DefaultCPUAllocator: not enough memory",
+    CUDA: "CUDA out of memory")."""
+    if isinstance(e, MemoryError):
+        return True
+    msg = str(e).lower()
+    return "not enough memory" in msg or "out of memory" in msg or "defaultcpuallocator" in msg
+
+
 class Aligner:
+    """batch_size = how many 30-second pieces of audio go through the model at once.
+
+    Memory grows with it: on CPU each piece needs roughly 0.5-1 GB at the model's first layer,
+    so 8 pieces (only reached by tracks longer than 4 minutes) asked for ~1.8 GB in a single
+    block and failed on machines with little free RAM. Batching barely speeds things up on CPU,
+    so CPU uses 2 by default. If memory still runs out, align() retries the same track with a
+    smaller batch (8 -> 4 -> 2 -> 1) and then shorter pieces (30 s -> 15 s), and keeps the
+    smaller setting for the rest of the run. The result is the same either way.
+    """
+
+    MIN_WINDOW = 10  # seconds; shorter pieces start to hurt accuracy at their edges
+
     def __init__(self, device: str | None, model_id: str, language: str,
-                 batch_size: int = 8, window_size: int = 30, context_size: int = 2):
+                 batch_size: int | None = None, window_size: int = 30, context_size: int = 2):
         self.device_arg, self.model_id, self.language = device, model_id, language
         self.batch_size, self.window_size, self.context_size = batch_size, window_size, context_size
         self._model = None
@@ -81,9 +102,47 @@ class Aligner:
         import ctc_forced_aligner as lib
         device = self.device_arg or ("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.float16 if device == "cuda" else torch.float32
+        if self.batch_size is None:
+            self.batch_size = 8 if device == "cuda" else 2
         print(f"Loading the alignment model on {device} (first time: downloads a few hundred MB) ...")
         self._model, self._tokenizer = lib.load_alignment_model(device, self.model_id, dtype=dtype)
         self._lib = lib
+
+    def _free_memory(self):
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _shrink(self) -> bool:
+        """One step smaller after running out of memory; False = nothing left to shrink."""
+        if self.batch_size > 1:
+            self.batch_size = max(1, self.batch_size // 2)
+            print(f"    (not enough memory - retrying with {self.batch_size} piece(s) at a time)")
+            return True
+        if self.window_size // 2 >= self.MIN_WINDOW:
+            self.window_size //= 2
+            print(f"    (not enough memory - retrying with {self.window_size}-second pieces)")
+            return True
+        return False
+
+    def _emissions(self, waveform):
+        while True:
+            try:
+                return self._lib.generate_emissions(
+                    self._model, waveform, self.window_size, self.context_size, self.batch_size)
+            except (RuntimeError, MemoryError) as e:
+                if not is_out_of_memory(e):
+                    raise
+                self._free_memory()
+                if not self._shrink():
+                    raise MemoryError(
+                        "not enough free memory even with the smallest settings. Close other "
+                        "programs (browser, Word, VS Code extensions) and try this track again.") from e
 
     def align(self, audio_path: Path, original_text: str) -> list:
         """Word results in text order: index i == word i of original_text.split()."""
@@ -91,8 +150,8 @@ class Aligner:
         lib = self._lib
         flat_text = original_text.replace("\n", " ").strip()
         waveform = lib.load_audio(str(audio_path), self._model.dtype, self._model.device)
-        emissions, stride = lib.generate_emissions(
-            self._model, waveform, self.window_size, self.context_size, self.batch_size)
+        emissions, stride = self._emissions(waveform)
+        del waveform
         tokens_starred, text_starred = lib.preprocess_text(
             flat_text, romanize=True, language=self.language, split_size="word", star_frequency="edges")
         segments, scores, blank_token = lib.get_alignments(emissions, tokens_starred, self._tokenizer)
@@ -320,7 +379,7 @@ def interactive(args) -> int:
     cfg = load_config()
     print("== align_engine: Word document + audio folder ==   (Ctrl+C quits at any time)\n")
     setup_paths(cfg)
-    aligner = Aligner(args.device, args.alignment_model, args.language)
+    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
 
     while True:
         docx, audio_dir = Path(cfg["docx"]), Path(cfg["audio_dir"])
@@ -378,7 +437,7 @@ def batch_docx(args) -> int:
     except ValueError as e:
         print(e)
         return 2
-    aligner = Aligner(args.device, args.alignment_model, args.language)
+    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
     _, failed = align_tracks(selected, aligner, out_dir, args.granularity,
                              overwrite=args.overwrite, dry_run=args.dry_run)
     return 1 if failed else 0
@@ -418,7 +477,7 @@ def batch_pairs(args) -> int:
     if not pairs:
         print("No (audio, text) pairs found.")
         return 1
-    aligner = Aligner(args.device, args.alignment_model, args.language)
+    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
     failed = []
     for a, t in pairs:
         print(f"Aligning {a.name} ...")
@@ -450,6 +509,9 @@ def main() -> int:
     ap.add_argument("--granularity", choices=["word", "sentence"], default="word")
     ap.add_argument("--language", default="eng", help="ISO 639-3 code (default: eng)")
     ap.add_argument("--device", default=None, help="cuda or cpu (default: automatic)")
+    ap.add_argument("--batch_size", type=int, default=None,
+                    help="30-second pieces per model run (default: 2 on CPU, 8 on GPU; lowered "
+                         "automatically if memory runs out)")
     ap.add_argument("--alignment_model", default=DEFAULT_MODEL,
                     help="HF model id or local path (default model is CC-BY-NC-4.0, see GUIDE.md)")
     args = ap.parse_args()
