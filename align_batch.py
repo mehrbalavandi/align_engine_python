@@ -10,6 +10,8 @@ Just run it (F5 in VS Code, run.bat, or `python align_batch.py`). It asks for:
   2. the folder with that book's audio files
 and then, again and again, which track numbers to align ("26", "26-31", "4,7-9",
 "all", "new"). Both paths are remembered in align_config.json for next time.
+To change the saved values: S in the menu, settings.bat, `--settings`, or `--reset`
+(forget everything and ask again); see GUIDE.md, "Changing the saved settings".
 
 For every chosen track it writes, into the output folder (default: <audio folder>/output):
     <audio stem>_draft.json    <- open in AudioMarkerReview (it finds it by itself)
@@ -344,6 +346,14 @@ def pick_with_dialog(title: str, want_dir: bool) -> str | None:
 
 
 def setup_paths(cfg: dict, force: bool = False) -> bool:
+    if force:
+        # show what is stored before asking, so Enter-to-keep is an informed choice
+        print(f"\nSettings (saved in {CONFIG_PATH}):")
+        print(f"  Word document : {cfg.get('docx') or '-'}")
+        print(f"  Audio folder  : {cfg.get('audio_dir') or '-'}")
+        print(f"  Output folder : {cfg.get('out_dir') or '<audio folder>/output'}")
+        print(f"  Markers       : {cfg.get('granularity', 'word')}")
+        print("  Enter keeps a value, '?' opens a picker, or type/drag a new path.\n")
     docx = Path(cfg["docx"]) if cfg.get("docx") else None
     audio = Path(cfg["audio_dir"]) if cfg.get("audio_dir") else None
     if force or docx is None or not docx.is_file():
@@ -376,9 +386,12 @@ def setup_paths(cfg: dict, force: bool = False) -> bool:
 
 
 def interactive(args) -> int:
+    if args.reset and CONFIG_PATH.exists():
+        CONFIG_PATH.unlink()
+        print(f"{CONFIG_PATH.name} removed: every setting will be asked again.")
     cfg = load_config()
     print("== align_engine: Word document + audio folder ==   (Ctrl+C quits at any time)\n")
-    setup_paths(cfg)
+    setup_paths(cfg, force=args.settings)
     aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
 
     while True:
@@ -424,7 +437,10 @@ def batch_docx(args) -> int:
     if docx is None or audio_dir is None:
         print("--docx and --audio_dir are needed (or run without arguments once to set them).")
         return 2
-    out_dir = args.out_dir or default_out_dir(audio_dir)
+    # the saved output folder / marker type apply here too (only when the audio folder is the saved one)
+    saved_out = cfg.get("out_dir") if not args.audio_dir or str(audio_dir) == cfg.get("audio_dir") else None
+    out_dir = args.out_dir or (Path(saved_out) if saved_out else default_out_dir(audio_dir))
+    granularity = args.granularity or cfg.get("granularity", "word")
     tracks = read_tracks(docx)
     match_audio(tracks, audio_dir)
     done = done_indices(tracks, out_dir)
@@ -438,7 +454,7 @@ def batch_docx(args) -> int:
         print(e)
         return 2
     aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
-    _, failed = align_tracks(selected, aligner, out_dir, args.granularity,
+    _, failed = align_tracks(selected, aligner, out_dir, granularity,
                              overwrite=args.overwrite, dry_run=args.dry_run)
     return 1 if failed else 0
 
@@ -483,7 +499,7 @@ def batch_pairs(args) -> int:
         print(f"Aligning {a.name} ...")
         try:
             text = read_pair_text(t)
-            low = write_outputs(out_dir, a.stem, a.name, text, aligner.align(a, text), args.granularity)
+            low = write_outputs(out_dir, a.stem, a.name, text, aligner.align(a, text), args.granularity or "word")
             print(f"  -> {a.stem}_draft.json ({low} low-confidence)")
         except Exception as e:  # noqa: BLE001
             print(f"  [FAILED] {e}")
@@ -506,7 +522,12 @@ def main() -> int:
     ap.add_argument("--share_dir", type=Path, help="old mode: folder with the pairs (default: ./share)")
     ap.add_argument("--text_dir", type=Path, help="old mode: separate folder for the texts")
     ap.add_argument("--pair_audio_dir", type=Path, help="old mode: separate folder for the audio")
-    ap.add_argument("--granularity", choices=["word", "sentence"], default="word")
+    ap.add_argument("--granularity", choices=["word", "sentence"], default=None,
+                    help="word (default) or sentence; without it the saved setting is used")
+    ap.add_argument("--settings", action="store_true",
+                    help="open the settings questions first (change the saved document/folders/markers)")
+    ap.add_argument("--reset", action="store_true",
+                    help="forget align_config.json and ask every setting again")
     ap.add_argument("--language", default="eng", help="ISO 639-3 code (default: eng)")
     ap.add_argument("--device", default=None, help="cuda or cpu (default: automatic)")
     ap.add_argument("--batch_size", type=int, default=None,
@@ -519,7 +540,7 @@ def main() -> int:
     try:
         if args.pairs or args.share_dir or args.text_dir or args.pair_audio_dir:
             return batch_pairs(args)
-        if args.docx or args.audio_dir or args.tracks:
+        if (args.docx or args.audio_dir or args.tracks) and not (args.settings or args.reset):
             return batch_docx(args)
         return interactive(args)
     except KeyboardInterrupt:
