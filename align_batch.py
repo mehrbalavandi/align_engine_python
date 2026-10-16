@@ -1,45 +1,32 @@
 """
-align_batch.py — Batch forced-alignment engine for the IELTS audio-script marker workflow.
+align_batch.py — word-level forced alignment for the IELTS audio scripts.
 
-For every (audio, text) pair found in the input folders, this script:
-  1. Runs word-level CTC forced alignment (ctc-forced-aligner / wav2vec2-MMS) between
-     the audio and the ALREADY-CORRECT transcript text.
-  2. Writes a marker-embedded .txt file using the exact "[ms]word[ms]word..." syntax
-     expected by CustomLayoutGenerator — ready to paste into the row-2 cell of the
-     audio-script Word table.
-  3. Writes a companion "draft" .json file (words, boundariesMs, per-word confidence
-     scores) that the WPF review tool loads to pre-fill its waveform markers instead
-     of starting from a blank timeline.
+Step 1 of the audio pipeline:
+    align_batch.py  ->  <stem>_draft.json  ->  AudioMarkerReview  ->  Word with [ms] markers
+                                                                  ->  CustomLayoutGenerator
 
-USAGE
------
-    python align_batch.py
+Just run it (F5 in VS Code, run.bat, or `python align_batch.py`). It asks for:
+  1. the Word document with all the audio-script tables (e.g. "Mindset1- Audio Scripts.docx")
+  2. the folder with that book's audio files
+and then, again and again, which track numbers to align ("26", "26-31", "4,7-9",
+"all", "new"). Both paths are remembered in align_config.json for next time.
 
-By default, everything lives in ONE folder called "share", sitting right
-next to this script — no arguments needed. Put your audio files and their
-matching text/.docx transcripts (same filename stem) together in there:
+For every chosen track it writes, into the output folder (default: <audio folder>/output):
+    <audio stem>_draft.json    <- open in AudioMarkerReview (it finds it by itself)
+    <audio stem>_markers.txt   <- the same timings as "[ms]word[ms]..." text, for a quick look
 
-    align_engine/
-      align_batch.py
-      share/
-        MindsetIELTS_L3_09.mp3
-        MindsetIELTS_L3_09.docx      (or .txt — same stem, no markers)
-        output/                       <- created automatically
-          MindsetIELTS_L3_09_markers.txt
-          MindsetIELTS_L3_09_draft.json
+Non-interactive (for scripts):
+    python align_batch.py --docx "Mindset1- Audio Scripts.docx" --audio_dir audio --tracks 26-31
+    python align_batch.py --docx ... --audio_dir ... --tracks new --dry-run      (only list)
 
-If you'd rather keep audio/text/output in separate folders (the old
-layout), pass --audio_dir / --text_dir / --out_dir to override any of
-them individually — anything you don't override still falls back to
-the "share" folder (or "share/output" for the output).
+Old mode (txt/docx + mp3 pairs with the same name in one folder):
+    python align_batch.py --pairs                 (uses the "share" folder next to this script)
+    python align_batch.py --pairs --share_dir D:\\work\\share
 
-Output:
-    <out_dir>/<stem>_markers.txt   <- paste into Word
-    <out_dir>/<stem>_draft.json    <- open in the WPF review tool
-
-See README.md in this folder for installation (ffmpeg + pip) and important
-notes on the alignment model's license.
+See GUIDE.md for the whole workflow.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -47,279 +34,436 @@ import re
 import sys
 from pathlib import Path
 
-import torch
+from docx_tracks import AUDIO_EXTS, Track, match_audio, parse_selection, read_tracks
 
-from ctc_forced_aligner import (
-    generate_emissions,
-    get_alignments,
-    get_spans,
-    load_alignment_model,
-    load_audio,
-    postprocess_results,
-    preprocess_text,
-)
-
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
-SCRIPT_EXTS = (".docx", ".txt")  # checked in this order — .docx preferred when both exist
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = SCRIPT_DIR / "align_config.json"
+DEFAULT_MODEL = "MahmoudAshraf/mms-300m-1130-forced-aligner"
+LOW_CONFIDENCE = -1.5  # words below this score are worth a look in AudioMarkerReview
 
 
 # ---------------------------------------------------------------------------
-# Reading the script text: either a plain .txt, or the same two-row Word
-# table (AudioTrackName row + script row) that AudioMarkerReview and
-# CustomLayoutGenerator both read — so you only maintain ONE source file
-# per audio, not a .docx plus a hand-kept-in-sync .txt.
+# Settings remembered between runs
 # ---------------------------------------------------------------------------
 
-def read_docx_script_text(docx_path: Path) -> str:
-    """Extracts row[1]'s plain text from the first qualifying 2-row table
-    (non-empty row[0] = AudioTrackName) in the .docx, exactly mirroring the
-    table CustomLayoutGenerator/AudioMarkerReview locate. Only the FIRST
-    matching table is used — split multi-track docs into one file per
-    track if you need more than that.
-    """
-    import docx  # python-docx
-
-    document = docx.Document(str(docx_path))
-    for table in document.tables:
-        if len(table.rows) < 2:
-            continue
-        track_name = table.rows[0].cells[0].text.strip()
-        if not track_name:
-            continue
-        parts = []
-        for cell in table.rows[1].cells:
-            for para in cell.paragraphs:
-                parts.append(para.text)
-        return "\n".join(parts)
-    raise ValueError(f"No 2-row table with a non-empty first row found in {docx_path.name}")
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
-def read_script_text(text_path: Path) -> str:
-    if text_path.suffix.lower() == ".docx":
-        return read_docx_script_text(text_path)
-    return text_path.read_text(encoding="utf-8")
+def save_config(cfg: dict) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        print(f"  (could not save {CONFIG_PATH.name}: {e})")
 
 
 # ---------------------------------------------------------------------------
-# Core alignment for a single file pair
+# Alignment (torch is imported only when something is actually aligned, so
+# listing tracks and --dry-run start instantly)
 # ---------------------------------------------------------------------------
 
-def align_one(model, tokenizer, audio_path: Path, text_path: Path, language: str,
-              batch_size: int, window_size: int, context_size: int) -> dict:
-    """Run word-level forced alignment for one (audio, text) pair.
+class Aligner:
+    def __init__(self, device: str | None, model_id: str, language: str,
+                 batch_size: int = 8, window_size: int = 30, context_size: int = 2):
+        self.device_arg, self.model_id, self.language = device, model_id, language
+        self.batch_size, self.window_size, self.context_size = batch_size, window_size, context_size
+        self._model = None
+        self._tokenizer = None
+        self._lib = None
 
-    Returns a dict with the ORIGINAL text plus the per-word results in the
-    exact order they appear in the text (so index i of `results` always
-    corresponds to word i of `original_text.split()`).
-    """
-    original_text = read_script_text(text_path)
-    # The library itself collapses newlines to spaces internally before
-    # splitting on whitespace for alignment purposes — we keep our own copy
-    # of the untouched original_text so we can restore real line breaks later.
-    flat_text = original_text.replace("\n", " ").strip()
+    def _load(self):
+        if self._model is not None:
+            return
+        import torch
+        import ctc_forced_aligner as lib
+        device = self.device_arg or ("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        print(f"Loading the alignment model on {device} (first time: downloads a few hundred MB) ...")
+        self._model, self._tokenizer = lib.load_alignment_model(device, self.model_id, dtype=dtype)
+        self._lib = lib
 
-    audio_waveform = load_audio(str(audio_path), model.dtype, model.device)
-    emissions, stride = generate_emissions(
-        model, audio_waveform, window_size, context_size, batch_size
-    )
+    def align(self, audio_path: Path, original_text: str) -> list:
+        """Word results in text order: index i == word i of original_text.split()."""
+        self._load()
+        lib = self._lib
+        flat_text = original_text.replace("\n", " ").strip()
+        waveform = lib.load_audio(str(audio_path), self._model.dtype, self._model.device)
+        emissions, stride = lib.generate_emissions(
+            self._model, waveform, self.window_size, self.context_size, self.batch_size)
+        tokens_starred, text_starred = lib.preprocess_text(
+            flat_text, romanize=True, language=self.language, split_size="word", star_frequency="edges")
+        segments, scores, blank_token = lib.get_alignments(emissions, tokens_starred, self._tokenizer)
+        spans = lib.get_spans(tokens_starred, segments, blank_token)
+        results = lib.postprocess_results(text_starred, spans, stride, scores)
 
-    tokens_starred, text_starred = preprocess_text(
-        flat_text, romanize=True, language=language, split_size="word", star_frequency="edges"
-    )
-
-    segments, scores, blank_token = get_alignments(emissions, tokens_starred, tokenizer)
-    spans = get_spans(tokens_starred, segments, blank_token)
-    results = postprocess_results(text_starred, spans, stride, scores)
-
-    # postprocess_results already drops the <star> edge tokens, so `results`
-    # should line up 1:1, in order, with original_text's whitespace-split words.
-    expected_words = flat_text.split()
-    if len(results) != len(expected_words):
-        raise ValueError(
-            f"Alignment produced {len(results)} word segments but the transcript has "
-            f"{len(expected_words)} words for {text_path.name}. This usually means the "
-            f"audio and text don't match exactly (missing/extra words, wrong file paired)."
-        )
-
-    return {"original_text": original_text, "results": results}
+        expected = flat_text.split()
+        if len(results) != len(expected):
+            raise ValueError(
+                f"the aligner returned {len(results)} words but the text has {len(expected)}. "
+                "Usually the text and the audio don't match (missing/extra words) or the wrong "
+                "audio file was paired.")
+        return results
 
 
 # ---------------------------------------------------------------------------
-# Reconstruct the "[ms]word[ms]word..." marker text, preserving the user's
-# original whitespace/line breaks exactly, and splitting silence gaps at
-# the midpoint between two words (since one marker == shared boundary
-# between the end of the previous span and the start of the next).
+# "[ms]word[ms]word..." text, keeping the original whitespace and line breaks.
+# One marker == shared boundary (end of the previous word AND start of the next),
+# placed in the middle of the silence between them.
 # ---------------------------------------------------------------------------
 
-def build_marker_text(original_text: str, results: list) -> tuple[str, list, list, list]:
-    tokens = re.findall(r"\S+|\s+", original_text)
+def build_boundaries(results: list) -> tuple[list, list, list]:
     n = len(results)
     if n == 0:
-        raise ValueError("No aligned words to build markers from.")
-
-    boundaries_ms = [0] * (n + 1)
-    boundaries_ms[0] = round(results[0]["start"] * 1000)
+        raise ValueError("no aligned words")
+    b = [0] * (n + 1)
+    b[0] = round(results[0]["start"] * 1000)
     for i in range(1, n):
-        boundaries_ms[i] = round(((results[i - 1]["end"] + results[i]["start"]) / 2) * 1000)
-    boundaries_ms[n] = round(results[-1]["end"] * 1000)
-
+        b[i] = round(((results[i - 1]["end"] + results[i]["start"]) / 2) * 1000)
+    b[n] = round(results[-1]["end"] * 1000)
     words = [r["text"] for r in results]
     scores = [round(r["score"], 4) for r in results]
+    return words, b, scores
 
-    out = []
-    word_idx = 0
-    for tok in tokens:
+
+def build_marker_text(original_text: str, boundaries_ms: list, keep: set | None = None) -> str:
+    """keep=None -> a marker after every word; otherwise only boundaries in `keep`."""
+    out, wi = [], 0
+    for tok in re.findall(r"\S+|\s+", original_text):
         if tok.strip() == "":
             out.append(tok)
             continue
-        if word_idx == 0:
+        if wi == 0:
             out.append(f"[{boundaries_ms[0]}]")
         out.append(tok)
-        out.append(f"[{boundaries_ms[word_idx + 1]}]")
-        word_idx += 1
+        if keep is None or (wi + 1) in keep:
+            out.append(f"[{boundaries_ms[wi + 1]}]")
+        wi += 1
+    return "".join(out)
 
-    return "".join(out), words, boundaries_ms, scores
 
-
-def collapse_to_sentence_boundaries(words, boundaries_ms):
-    """Optional: keep only markers at sentence-ending punctuation, for a
-    coarser (sentence-level) marker file instead of word-level."""
-    sentence_end = re.compile(r"[.!?]\"?'?$")
+def sentence_boundaries(words: list) -> set:
+    end = re.compile(r"[.!?]\"?'?$")
     keep = {0, len(words)}
-    for i, w in enumerate(words):
-        if sentence_end.search(w):
-            keep.add(i + 1)
-    return sorted(keep)
+    keep.update(i + 1 for i, w in enumerate(words) if end.search(w))
+    return keep
 
 
-# ---------------------------------------------------------------------------
-# Batch driver
-# ---------------------------------------------------------------------------
-
-def find_pairs(audio_dir: Path, text_dir: Path):
-    pairs = []
-    for audio_path in sorted(audio_dir.iterdir()):
-        if audio_path.suffix.lower() not in AUDIO_EXTS:
-            continue
-        text_path = None
-        for ext in SCRIPT_EXTS:
-            candidate = text_dir / f"{audio_path.stem}{ext}"
-            if candidate.exists():
-                text_path = candidate
-                break
-        if text_path is not None:
-            pairs.append((audio_path, text_path))
-        else:
-            print(f"  [skip] no matching .docx or .txt for {audio_path.name} "
-                  f"(expected {audio_path.stem}.docx or {audio_path.stem}.txt)", file=sys.stderr)
-    return pairs
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--share_dir", type=Path, default=None,
-                     help="Single folder holding BOTH audio and text/.docx files, matched by "
-                          "filename stem. Defaults to a 'share' folder next to this script. "
-                          "Outputs go to <share_dir>/output unless --out_dir overrides it.")
-    ap.add_argument("--audio_dir", type=Path, default=None,
-                     help="Override: use a separate folder for audio instead of --share_dir.")
-    ap.add_argument("--text_dir", type=Path, default=None,
-                     help="Override: use a separate folder for text/.docx instead of --share_dir.")
-    ap.add_argument("--out_dir", type=Path, default=None,
-                     help="Override: write outputs somewhere other than <share_dir>/output.")
-    ap.add_argument("--language", default="eng", help="ISO 639-3 code (default: eng)")
-    ap.add_argument("--granularity", choices=["word", "sentence"], default="word",
-                     help="word = a marker after every word (default); "
-                          "sentence = markers only at sentence-ending punctuation")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--batch_size", type=int, default=8)
-    ap.add_argument("--window_size", type=int, default=30)
-    ap.add_argument("--context_size", type=int, default=2)
-    ap.add_argument("--alignment_model", default="MahmoudAshraf/mms-300m-1130-forced-aligner",
-                     help="HF model id or local path. NOTE: the default model is "
-                          "CC-BY-NC-4.0 licensed (non-commercial) — see README.md")
-    args = ap.parse_args()
-
-    script_dir = Path(__file__).resolve().parent
-    share_dir = args.share_dir or (script_dir / "share")
-    audio_dir = args.audio_dir or share_dir
-    text_dir = args.text_dir or share_dir
-    out_dir = args.out_dir or (share_dir / "output")
-
-    for label, d in (("audio", audio_dir), ("text", text_dir)):
-        if not d.exists():
-            print(f"{label.capitalize()} folder not found: {d}\n"
-                  f"Create it and put your audio + matching text/.docx files inside "
-                  f"(same filename stem for each pair), then re-run.", file=sys.stderr)
-            sys.exit(1)
-
+def write_outputs(out_dir: Path, stem: str, audio_name: str, text: str,
+                  results: list, granularity: str) -> int:
+    words, boundaries, scores = build_boundaries(results)
+    keep = sentence_boundaries(words) if granularity == "sentence" else None
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{stem}_markers.txt").write_text(
+        build_marker_text(text, boundaries, keep), encoding="utf-8")
+    draft = {"audioFile": audio_name, "words": words, "boundariesMs": boundaries, "scores": scores}
+    (out_dir / f"{stem}_draft.json").write_text(
+        json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
+    return sum(1 for s in scores if s < LOW_CONFIDENCE)
 
-    pairs = find_pairs(audio_dir, text_dir)
-    if not pairs:
-        print("No matching (audio, text) pairs found.", file=sys.stderr)
-        sys.exit(1)
-    print(f"Found {len(pairs)} file pair(s). Loading alignment model on {args.device} ...")
 
-    dtype = torch.float16 if args.device == "cuda" else torch.float32
-    model, tokenizer = load_alignment_model(args.device, args.alignment_model, dtype=dtype)
+# ---------------------------------------------------------------------------
+# Word document + audio folder mode
+# ---------------------------------------------------------------------------
+
+def default_out_dir(audio_dir: Path) -> Path:
+    return audio_dir / "output"
+
+
+def done_indices(tracks: list[Track], out_dir: Path) -> set[int]:
+    return {t.index for t in tracks if (out_dir / f"{t.stem}_draft.json").exists()}
+
+
+def print_tracks(tracks: list[Track], done: set[int]) -> None:
+    print(f"\n  {'No.':>4}  {'track':<28} {'words':>6}  audio / status")
+    for t in tracks:
+        if t.has_markers:
+            status = "! text already has [ms] markers — use the unmarked document"
+        elif t.audio is None:
+            status = f"! {t.note}"
+        else:
+            status = t.audio.name + ("   (aligned)" if t.index in done else "")
+        print(f"  {t.number:>4}  {t.name[:28]:<28} {t.word_count:>6}  {status}")
+    print()
+
+
+def summary_line(tracks: list[Track], done: set[int]) -> str:
+    if not tracks:
+        return "no audio-script tables found"
+    nums = [t.number for t in tracks]
+    with_audio = sum(1 for t in tracks if t.audio is not None and not t.has_markers)
+    return (f"{len(tracks)} tracks ({min(nums)}–{max(nums)}), {with_audio} ready to align, "
+            f"{len(done)} already aligned")
+
+
+def align_tracks(selected: list[Track], aligner: Aligner, out_dir: Path, granularity: str,
+                 overwrite: bool | None, dry_run: bool = False) -> tuple[int, list]:
+    """overwrite: True / False / None (= ask once if some outputs already exist)."""
+    runnable = [t for t in selected if t.audio is not None and not t.has_markers]
+    for t in selected:
+        if t not in runnable:
+            reason = "text already has markers" if t.has_markers else t.note
+            print(f"  [skip] {t.number} {t.name}: {reason}")
+
+    existing = [t for t in runnable if (out_dir / f"{t.stem}_draft.json").exists()]
+    if existing and overwrite is None:
+        nums = ", ".join(str(t.number) for t in existing)
+        ans = input(f"  {len(existing)} already aligned ({nums}). Overwrite them? [y/N] ").strip().lower()
+        overwrite = ans in ("y", "yes")
+    if existing and not overwrite:
+        runnable = [t for t in runnable if t not in existing]
+        print(f"  keeping the existing outputs of {len(existing)} track(s)")
+
+    if dry_run:
+        for t in runnable:
+            print(f"  would align {t.number}: {t.audio.name}  ({t.word_count} words)"
+                  f"  ->  {out_dir / (t.stem + '_draft.json')}")
+        return 0, []
+    if not runnable:
+        print("  nothing to align")
+        return 0, []
 
     ok, failed = 0, []
-    for audio_path, text_path in pairs:
-        print(f"Aligning {audio_path.name} ...")
+    for i, t in enumerate(runnable, 1):
+        print(f"[{i}/{len(runnable)}] {t.number}: {t.audio.name} ({t.word_count} words) ...")
         try:
-            aligned = align_one(
-                model, tokenizer, audio_path, text_path, args.language,
-                args.batch_size, args.window_size, args.context_size,
-            )
-            marker_text, words, boundaries_ms, scores = build_marker_text(
-                aligned["original_text"], aligned["results"]
-            )
-
-            if args.granularity == "sentence":
-                keep_idx = collapse_to_sentence_boundaries(words, boundaries_ms)
-                # Re-flatten with only the kept boundary markers. Each boundary is
-                # emitted exactly once, right after the word that precedes it — it
-                # simultaneously serves as the start marker of the next chunk, so
-                # we must NOT also emit it again before that next word.
-                tokens = re.findall(r"\S+|\s+", aligned["original_text"])
-                out, wi = [], 0
-                for tok in tokens:
-                    if tok.strip() == "":
-                        out.append(tok)
-                        continue
-                    if wi == 0:
-                        out.append(f"[{boundaries_ms[0]}]")
-                    out.append(tok)
-                    if (wi + 1) in keep_idx:
-                        out.append(f"[{boundaries_ms[wi + 1]}]")
-                    wi += 1
-                marker_text = "".join(out)
-
-            stem = audio_path.stem
-            (out_dir / f"{stem}_markers.txt").write_text(marker_text, encoding="utf-8")
-            draft = {
-                "audioFile": audio_path.name,
-                "words": words,
-                "boundariesMs": boundaries_ms,
-                "scores": scores,
-            }
-            (out_dir / f"{stem}_draft.json").write_text(
-                json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            low_conf = sum(1 for s in scores if s < -1.5)
-            print(f"  -> wrote {stem}_markers.txt and {stem}_draft.json "
-                  f"({len(words)} words, {low_conf} low-confidence)")
+            results = aligner.align(t.audio, t.text)
+            low = write_outputs(out_dir, t.stem, t.audio.name, t.text, results, granularity)
+            note = f", {low} low-confidence word(s) to check" if low else ""
+            print(f"    -> {t.stem}_draft.json{note}")
             ok += 1
-        except Exception as e:  # noqa: BLE001 — batch job, keep going on per-file failure
-            print(f"  [FAILED] {audio_path.name}: {e}", file=sys.stderr)
-            failed.append(audio_path.name)
-
-    print(f"\nDone: {ok} succeeded, {len(failed)} failed.")
+        except KeyboardInterrupt:
+            print("\n  stopped by you (Ctrl+C)")
+            break
+        except ModuleNotFoundError as e:
+            print(f"    [STOPPED] {e}.\n    The Python packages aren't installed in this environment: run "
+                  "setup.ps1 once, and run the script with run.bat (or select the .venv interpreter "
+                  "in VS Code). See GUIDE.md, section 1.")
+            failed.extend(runnable[i - 1:])
+            break
+        except Exception as e:  # noqa: BLE001 — keep going with the next track
+            print(f"    [FAILED] {e}")
+            failed.append(t)
+    print(f"\nDone: {ok} aligned, {len(failed)} failed. Output folder: {out_dir}")
     if failed:
-        print("Failed files:", ", ".join(failed))
-        sys.exit(1)
+        print("Failed: " + ", ".join(f"{t.number} ({t.name})" for t in failed))
+    return ok, failed
+
+
+def ask_path(prompt: str, current: str | None, want_dir: bool) -> Path | None:
+    """Enter = keep current; '?' (or Enter when nothing is set) = Windows picker;
+    a typed/dragged path is also fine (quotes and PowerShell's '& ' are removed)."""
+    hint = f" [Enter = {current}]" if current else " [Enter = open a picker]"
+    raw = input(f"{prompt}{hint}: ").strip()
+    if raw == "" and current:
+        return Path(current)
+    if raw in ("", "?"):
+        picked = pick_with_dialog(prompt, want_dir)
+        return Path(picked) if picked else (Path(current) if current else None)
+    raw = re.sub(r"^&\s*", "", raw).strip().strip('"').strip("'")
+    return Path(raw).expanduser()
+
+
+def pick_with_dialog(title: str, want_dir: bool) -> str | None:
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        if want_dir:
+            path = filedialog.askdirectory(title=title)
+        else:
+            path = filedialog.askopenfilename(title=title, filetypes=[("Word document", "*.docx")])
+        root.destroy()
+        return path or None
+    except Exception as e:  # noqa: BLE001 — no GUI available: fall back to typing
+        print(f"  (no file picker available: {e}; type or paste the path instead)")
+        return None
+
+
+def setup_paths(cfg: dict, force: bool = False) -> bool:
+    docx = Path(cfg["docx"]) if cfg.get("docx") else None
+    audio = Path(cfg["audio_dir"]) if cfg.get("audio_dir") else None
+    if force or docx is None or not docx.is_file():
+        while True:
+            docx = ask_path("Word document with the audio scripts", cfg.get("docx"), want_dir=False)
+            if docx and docx.is_file() and docx.suffix.lower() == ".docx":
+                break
+            print("  not a .docx file — try again (Ctrl+C to quit)")
+    if force or audio is None or not audio.is_dir():
+        while True:
+            audio = ask_path("Folder with its audio files", cfg.get("audio_dir"), want_dir=True)
+            if audio and audio.is_dir():
+                break
+            print("  folder not found — try again")
+    if force:
+        cur_out = cfg.get("out_dir") or str(default_out_dir(audio))
+        raw = input(f"Output folder [Enter = {cur_out}, '-' = <audio folder>/output]: ").strip()
+        raw = re.sub(r"^&\s*", "", raw).strip().strip('"').strip("'")
+        if raw == "-":
+            cfg.pop("out_dir", None)
+        elif raw:
+            cfg["out_dir"] = raw
+        g = input(f"Markers after every word or only at sentence ends? [w/s, Enter = "
+                  f"{cfg.get('granularity', 'word')[0]}]: ").strip().lower()
+        if g in ("w", "s"):
+            cfg["granularity"] = "word" if g == "w" else "sentence"
+    cfg["docx"], cfg["audio_dir"] = str(docx), str(audio)
+    save_config(cfg)
+    return True
+
+
+def interactive(args) -> int:
+    cfg = load_config()
+    print("== align_engine: Word document + audio folder ==   (Ctrl+C quits at any time)\n")
+    setup_paths(cfg)
+    aligner = Aligner(args.device, args.alignment_model, args.language)
+
+    while True:
+        docx, audio_dir = Path(cfg["docx"]), Path(cfg["audio_dir"])
+        out_dir = Path(cfg["out_dir"]) if cfg.get("out_dir") else default_out_dir(audio_dir)
+        granularity = cfg.get("granularity", "word")
+        try:
+            tracks = read_tracks(docx)
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not read {docx}: {e}")
+            setup_paths(cfg, force=True)
+            continue
+        match_audio(tracks, audio_dir)
+        done = done_indices(tracks, out_dir)
+
+        print(f"\nDocument : {docx.name}\nAudio    : {audio_dir}\nOutput   : {out_dir}"
+              f"\nMarkers  : {granularity}\n{summary_line(tracks, done)}")
+        spec = input("\nTracks to align (26 | 26-31 | 4,7-9 | all | new)   "
+                     "L = list, S = settings, Q = quit: ").strip()
+        low = spec.lower()
+        if low in ("q", "quit", "exit"):
+            return 0
+        if low in ("l", "list"):
+            print_tracks(tracks, done)
+            continue
+        if low in ("s", "settings"):
+            setup_paths(cfg, force=True)
+            continue
+        if not spec:
+            continue
+        try:
+            selected = parse_selection(spec, tracks, done)
+        except ValueError as e:
+            print(f"  {e}")
+            continue
+        align_tracks(selected, aligner, out_dir, granularity, overwrite=None)
+
+
+def batch_docx(args) -> int:
+    cfg = load_config()
+    docx = args.docx or (Path(cfg["docx"]) if cfg.get("docx") else None)
+    audio_dir = args.audio_dir or (Path(cfg["audio_dir"]) if cfg.get("audio_dir") else None)
+    if docx is None or audio_dir is None:
+        print("--docx and --audio_dir are needed (or run without arguments once to set them).")
+        return 2
+    out_dir = args.out_dir or default_out_dir(audio_dir)
+    tracks = read_tracks(docx)
+    match_audio(tracks, audio_dir)
+    done = done_indices(tracks, out_dir)
+    print(summary_line(tracks, done))
+    if not args.tracks:
+        print_tracks(tracks, done)
+        return 0
+    try:
+        selected = parse_selection(args.tracks, tracks, done)
+    except ValueError as e:
+        print(e)
+        return 2
+    aligner = Aligner(args.device, args.alignment_model, args.language)
+    _, failed = align_tracks(selected, aligner, out_dir, args.granularity,
+                             overwrite=args.overwrite, dry_run=args.dry_run)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# Old mode: <stem>.mp3 + <stem>.txt/.docx pairs in one folder
+# ---------------------------------------------------------------------------
+
+def read_pair_text(path: Path) -> str:
+    if path.suffix.lower() == ".docx":
+        tracks = read_tracks(path)
+        if not tracks:
+            raise ValueError(f"no audio-script table in {path.name}")
+        return tracks[0].text
+    return path.read_text(encoding="utf-8-sig")
+
+
+def batch_pairs(args) -> int:
+    share = args.share_dir or (SCRIPT_DIR / "share")
+    audio_dir, text_dir = args.pair_audio_dir or share, args.text_dir or share
+    out_dir = args.out_dir or (share / "output")
+    for label, d in (("audio", audio_dir), ("text", text_dir)):
+        if not d.is_dir():
+            print(f"{label} folder not found: {d}")
+            return 1
+    pairs = []
+    for a in sorted(audio_dir.iterdir()):
+        if a.suffix.lower() not in AUDIO_EXTS:
+            continue
+        t = next((text_dir / f"{a.stem}{e}" for e in (".docx", ".txt")
+                  if (text_dir / f"{a.stem}{e}").exists()), None)
+        if t is None:
+            print(f"  [skip] no {a.stem}.docx or {a.stem}.txt")
+        else:
+            pairs.append((a, t))
+    if not pairs:
+        print("No (audio, text) pairs found.")
+        return 1
+    aligner = Aligner(args.device, args.alignment_model, args.language)
+    failed = []
+    for a, t in pairs:
+        print(f"Aligning {a.name} ...")
+        try:
+            text = read_pair_text(t)
+            low = write_outputs(out_dir, a.stem, a.name, text, aligner.align(a, text), args.granularity)
+            print(f"  -> {a.stem}_draft.json ({low} low-confidence)")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [FAILED] {e}")
+            failed.append(a.name)
+    print(f"\nDone: {len(pairs) - len(failed)} succeeded, {len(failed)} failed.")
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--docx", type=Path, help="Word document with all the audio-script tables")
+    ap.add_argument("--audio_dir", type=Path, help="folder with the book's audio files")
+    ap.add_argument("--tracks", help='which tracks: "26", "26-31", "4,7-9", "all", "new" (not yet aligned)')
+    ap.add_argument("--out_dir", type=Path, help="default: <audio_dir>/output")
+    ap.add_argument("--overwrite", action="store_true", help="re-align tracks that already have outputs")
+    ap.add_argument("--dry-run", action="store_true", help="only show what would be aligned")
+    ap.add_argument("--pairs", action="store_true", help="old mode: same-name audio + txt/docx pairs")
+    ap.add_argument("--share_dir", type=Path, help="old mode: folder with the pairs (default: ./share)")
+    ap.add_argument("--text_dir", type=Path, help="old mode: separate folder for the texts")
+    ap.add_argument("--pair_audio_dir", type=Path, help="old mode: separate folder for the audio")
+    ap.add_argument("--granularity", choices=["word", "sentence"], default="word")
+    ap.add_argument("--language", default="eng", help="ISO 639-3 code (default: eng)")
+    ap.add_argument("--device", default=None, help="cuda or cpu (default: automatic)")
+    ap.add_argument("--alignment_model", default=DEFAULT_MODEL,
+                    help="HF model id or local path (default model is CC-BY-NC-4.0, see GUIDE.md)")
+    args = ap.parse_args()
+
+    try:
+        if args.pairs or args.share_dir or args.text_dir or args.pair_audio_dir:
+            return batch_pairs(args)
+        if args.docx or args.audio_dir or args.tracks:
+            return batch_docx(args)
+        return interactive(args)
+    except KeyboardInterrupt:
+        print("\nBye.")
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

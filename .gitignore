@@ -4,3 +4,6 @@ __pycache__/
 
 # generated per-run outputs — remove this line if you'd rather version them too
 # output/
+
+# remembered paths of this machine (align_batch.py writes it)
+align_config.json

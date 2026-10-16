@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "align_engine (interactive)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/align_batch.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true
+    },
+    {
+      "name": "align_engine (old: share folder pairs)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/align_batch.py",
+      "args": ["--pairs"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

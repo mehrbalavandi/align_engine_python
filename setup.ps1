@@ -60,7 +60,6 @@ Write-Host "`n== Installing Python dependencies (torch is large — this can tak
 & ".venv\Scripts\python.exe" -m pip install -r requirements.txt
 
 Write-Host "`n== Done ==" -ForegroundColor Green
-Write-Host "From now on, in any NEW terminal, activate the environment first:"
-Write-Host "    .venv\Scripts\Activate.ps1"
-Write-Host "then run, e.g.:"
-Write-Host "    python align_batch.py --audio_dir audio --text_dir text --out_dir output"
+Write-Host "To run it: double-click run.bat, or press F5 in VS Code (it uses .venv automatically)."
+Write-Host "It asks for the Word document with the audio scripts and the audio folder, then for track numbers."
+Write-Host "See GUIDE.md for the whole workflow."
