@@ -37,11 +37,12 @@ CustomLayoutGenerator  ──►  JSONِ کتاب برای اپ
 5. مخزن را بگیرید و نصب را اجرا کنید:
    ```powershell
    git clone https://github.com/mehrbalavandi/align_engine_python
-   cd align_engine_python
-   .\setup.ps1
    ```
-   - **اگر PowerShell اجازه‌ی اجرای اسکریپت نداد:**
-     `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+   بعد در پوشه‌ی مخزن روی **`setup.bat`** دوبار کلیک کنید.
+   - **مجوزِ اجرای اسکریپت:** `setup.bat` اسکریپت را بدونِ عوض‌کردنِ تنظیماتِ ویندوز اجرا
+     می‌کند، پس `Set-ExecutionPolicy` لازم نیست.
+   - **از داخلِ PowerShell یا VS Code:** `.\setup.ps1` هم کار می‌کند. اگر PowerShell اجازه
+     نداد، اول `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` را بزنید.
    - **`setup.ps1` چه می‌کند:** پوشه‌ی `.venv` را می‌سازد و PyTorch و کتابخانه‌ی aligner را
      نصب می‌کند. چند دقیقه طول می‌کشد.
 6. **اولین تراز‌بندی:** مدل را یک‌بار از اینترنت می‌گیرد (چند صد مگابایت). دفعه‌های بعد
@@ -147,7 +148,8 @@ Tracks to align (26 | 26-31 | 4,7-9 | all | new)   L = list, S = settings, Q = q
 | `! ambiguous: …` | دو فایلِ صوتی با این نام جور شده‌اند. یکی را از پوشه بیرون ببرید یا نامش را دقیق کنید. |
 | `! text already has [ms] markers` | سندِ مارکردار را داده‌اید. با `S` سندِ **بدونِ مارکر** را انتخاب کنید. |
 | `the aligner returned N words but the text has M` | متنِ جدول با آنچه گوینده می‌گوید فرق دارد، یا فایلِ صوتیِ اشتباه جفت شده است. متن را با صوت مقایسه و اصلاح کنید. |
-| `[STOPPED] No module named 'torch'` | برنامه بیرون از `.venv` اجرا شده است. با `run.bat` اجرا کنید، یا در VS Code مفسرِ `.venv` را انتخاب کنید. اگر `.venv` نیست، `setup.ps1` را بزنید. |
+| `[STOPPED] No module named 'torch'` | برنامه بیرون از `.venv` اجرا شده است. با `run.bat` اجرا کنید، یا در VS Code مفسرِ `.venv` را انتخاب کنید. اگر `.venv` نیست، `setup.bat` را بزنید. |
+| `setup.ps1`: `Missing closing '}'` یا `Unexpected token` | یک حرفِ غیرِانگلیسی (مثلاً خط‌تیره‌ی بلندِ «—») واردِ `setup.ps1` شده است. PowerShellِ ویندوز فایلِ بدونِ BOM را با کدگذاریِ ANSI می‌خواند و این حرف رشته را می‌شکند. این فایل باید فقط حروفِ ASCII داشته باشد. |
 | خطای FFmpeg / decode | FFmpeg نصب نیست یا در PATH نیست. بخشِ ۱، قدمِ ۳. |
 | خیلی کند است | روی CPU هر دقیقه صوت چند ثانیه تا چند ده ثانیه طول می‌کشد. چند ترک را با هم بدهید (مثلاً `new`) و کارِ دیگری بکنید. |
 | AudioMarkerReview پیش‌نویس را بار نکرد | نوارِ وضعیت دلیلش را می‌گوید. معمولاً یکی از این دو است: پیش‌نویس در `output`ِ کنارِ فایل‌های صوتی نیست، یا متنِ جدول بعد از تراز‌بندی عوض شده و تعدادِ کلمات فرق کرده است. ترک را دوباره تراز کنید. |
@@ -159,7 +161,7 @@ Tracks to align (26 | 26-31 | 4,7-9 | all | new)   L = list, S = settings, Q = q
 | `align_batch.py` | برنامه‌ی اصلی: منو، تراز‌بندی، نوشتنِ خروجی |
 | `docx_tracks.py` | خواندنِ جدول‌های سند، جفت کردنِ هر ترک با فایلِ صوتی، فهمیدنِ «26-31». فقط کتابخانه‌ی استانداردِ پایتون. |
 | `run.bat` | اجرا با دوبار کلیک |
-| `setup.ps1` | نصبِ یک‌باره |
+| `setup.bat` / `setup.ps1` | نصبِ یک‌باره (`setup.bat` همان `setup.ps1` را اجرا می‌کند). `setup.ps1` باید فقط ASCII بماند. |
 | `requirements.txt` | PyTorch، Transformers، ctc-forced-aligner |
 | `.vscode/` | F5 و مفسرِ `.venv` |
 | `align_config.json` | مسیرهای همین سیستم. در گیت نیست و خودکار ساخته می‌شود. |
