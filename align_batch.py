@@ -37,6 +37,7 @@ import sys
 from pathlib import Path
 
 from docx_tracks import AUDIO_EXTS, Track, match_audio, parse_selection, read_tracks
+from speech_text import label_word_indices, speakable
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "align_config.json"
@@ -90,8 +91,12 @@ class Aligner:
     MIN_WINDOW = 10  # seconds; shorter pieces start to hurt accuracy at their edges
 
     def __init__(self, device: str | None, model_id: str, language: str,
-                 batch_size: int | None = None, window_size: int = 30, context_size: int = 2):
+                 batch_size: int | None = None, window_size: int = 30, context_size: int = 2,
+                 star_frequency: str = "segment"):
         self.device_arg, self.model_id, self.language = device, model_id, language
+        # "segment": a <star> before every word (absorbs speech that isn't in the script);
+        # "edges": only at the start and end (the old behaviour)
+        self.star_frequency = star_frequency
         self.batch_size, self.window_size, self.context_size = batch_size, window_size, context_size
         self._model = None
         self._tokenizer = None
@@ -146,47 +151,88 @@ class Aligner:
                         "not enough free memory even with the smallest settings. Close other "
                         "programs (browser, Word, VS Code extensions) and try this track again.") from e
 
-    def align(self, audio_path: Path, original_text: str) -> list:
-        """Word results in text order: index i == word i of original_text.split()."""
+    def align(self, audio_path: Path, original_text: str, skip: set[int] | None = None) -> list:
+        """One entry per word of original_text.split(): the aligner's {start, end, score} for
+        the words it aligned, None for the words in `skip` (unspoken) and for words with
+        nothing to say (punctuation only, like "-").
+
+        Only the spoken words go to the model, numbers spelled out ("1" -> "one"), and a
+        <star> token sits before every word ("segment"), so speech that isn't in the script
+        (an instruction read between two parts) is matched to <star> instead of being
+        pulled into the neighbouring words."""
         self._load()
         lib = self._lib
-        flat_text = original_text.replace("\n", " ").strip()
+        words = original_text.split()
+        skip = skip or set()
+        spoken = [(i, speakable(w)) for i, w in enumerate(words) if i not in skip]
+        spoken = [(i, w) for i, w in spoken if any(ch.isalpha() for ch in w)]
+        if not spoken:
+            raise ValueError("no spoken words in this track")
         waveform = lib.load_audio(str(audio_path), self._model.dtype, self._model.device)
         emissions, stride = self._emissions(waveform)
         del waveform
         tokens_starred, text_starred = lib.preprocess_text(
-            flat_text, romanize=True, language=self.language, split_size="word", star_frequency="edges")
+            " ".join(w for _, w in spoken), romanize=True, language=self.language,
+            split_size="word", star_frequency=self.star_frequency)
         segments, scores, blank_token = lib.get_alignments(emissions, tokens_starred, self._tokenizer)
         spans = lib.get_spans(tokens_starred, segments, blank_token)
         results = lib.postprocess_results(text_starred, spans, stride, scores)
 
-        expected = flat_text.split()
-        if len(results) != len(expected):
+        if len(results) != len(spoken):
             raise ValueError(
-                f"the aligner returned {len(results)} words but the text has {len(expected)}. "
+                f"the aligner returned {len(results)} words but the text has {len(spoken)} spoken words. "
                 "Usually the text and the audio don't match (missing/extra words) or the wrong "
                 "audio file was paired.")
-        return results
+        full: list = [None] * len(words)
+        for (i, _), r in zip(spoken, results):
+            full[i] = r
+        return full
 
 
 # ---------------------------------------------------------------------------
 # "[ms]word[ms]word..." text, keeping the original whitespace and line breaks.
 # One marker == shared boundary (end of the previous word AND start of the next),
 # placed in the middle of the silence between them.
+# Unspoken words (speaker labels, "NotSpoken" style) take the whole silence between the
+# spoken words around them: the word before ends at its real end, the word after starts
+# at its real start, and the app never highlights the label (A-2 in CustomLayoutGenerator).
+# Words with nothing to say ("-") get zero length.
 # ---------------------------------------------------------------------------
 
-def build_boundaries(results: list) -> tuple[list, list, list]:
-    n = len(results)
-    if n == 0:
+def build_boundaries(words: list, results: list, unspoken: set[int] | None = None) -> tuple[list, list, list]:
+    """words: text.split(); results: Aligner.align() output (None = not aligned)."""
+    n = len(words)
+    unspoken = unspoken or set()
+    aligned = [i for i, r in enumerate(results) if r is not None]
+    if not aligned:
         raise ValueError("no aligned words")
+    ms = lambda sec: round(sec * 1000)  # noqa: E731
     b = [0] * (n + 1)
-    b[0] = round(results[0]["start"] * 1000)
-    for i in range(1, n):
-        b[i] = round(((results[i - 1]["end"] + results[i]["start"]) / 2) * 1000)
-    b[n] = round(results[-1]["end"] * 1000)
-    words = [r["text"] for r in results]
-    scores = [round(r["score"], 4) for r in results]
-    return words, b, scores
+    first, last = aligned[0], aligned[-1]
+    for i in range(0, first + 1):
+        b[i] = ms(results[first]["start"])
+    for k1, k2 in zip(aligned, aligned[1:]):
+        end, start = ms(results[k1]["end"]), ms(results[k2]["start"])
+        between = range(k1 + 1, k2)
+        holders = [i for i in between if i in unspoken]
+        if not holders:
+            mid = round((end + start) / 2)
+            for i in range(k1 + 1, k2 + 1):
+                b[i] = mid
+            continue
+        # the gap [end, start] is shared evenly by the unspoken words; the rest get zero length
+        share = (start - end) / len(holders)
+        t = float(end)
+        b[k1 + 1] = end
+        for i in between:
+            if i in unspoken:
+                t += share
+            b[i + 1] = round(t)
+        b[k2] = start
+    for i in range(last + 1, n + 1):
+        b[i] = ms(results[last]["end"])
+    scores = [round(r["score"], 4) if r is not None else 0.0 for r in results]
+    return list(words), b, scores
 
 
 def build_marker_text(original_text: str, boundaries_ms: list, keep: set | None = None) -> str:
@@ -212,9 +258,14 @@ def sentence_boundaries(words: list) -> set:
     return keep
 
 
+def unspoken_words(text: str, styled: set[int] | None = None) -> set[int]:
+    """Speaker labels at paragraph starts + words styled "NotSpoken" in Word."""
+    return label_word_indices(text) | (styled or set())
+
+
 def write_outputs(out_dir: Path, stem: str, audio_name: str, text: str,
-                  results: list, granularity: str) -> int:
-    words, boundaries, scores = build_boundaries(results)
+                  results: list, granularity: str, unspoken: set[int] | None = None) -> int:
+    words, boundaries, scores = build_boundaries(text.split(), results, unspoken)
     keep = sentence_boundaries(words) if granularity == "sentence" else None
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"{stem}_markers.txt").write_text(
@@ -290,8 +341,9 @@ def align_tracks(selected: list[Track], aligner: Aligner, out_dir: Path, granula
     for i, t in enumerate(runnable, 1):
         print(f"[{i}/{len(runnable)}] {t.number}: {t.audio.name} ({t.word_count} words) ...")
         try:
-            results = aligner.align(t.audio, t.text)
-            low = write_outputs(out_dir, t.stem, t.audio.name, t.text, results, granularity)
+            unspoken = unspoken_words(t.text, t.not_spoken)
+            results = aligner.align(t.audio, t.text, unspoken)
+            low = write_outputs(out_dir, t.stem, t.audio.name, t.text, results, granularity, unspoken)
             note = f", {low} low-confidence word(s) to check" if low else ""
             print(f"    -> {t.stem}_draft.json{note}")
             ok += 1
@@ -392,7 +444,8 @@ def interactive(args) -> int:
     cfg = load_config()
     print("== align_engine: Word document + audio folder ==   (Ctrl+C quits at any time)\n")
     setup_paths(cfg, force=args.settings)
-    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
+    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size,
+                      star_frequency=args.star)
 
     while True:
         docx, audio_dir = Path(cfg["docx"]), Path(cfg["audio_dir"])
@@ -453,7 +506,8 @@ def batch_docx(args) -> int:
     except ValueError as e:
         print(e)
         return 2
-    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
+    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size,
+                      star_frequency=args.star)
     _, failed = align_tracks(selected, aligner, out_dir, granularity,
                              overwrite=args.overwrite, dry_run=args.dry_run)
     return 1 if failed else 0
@@ -493,13 +547,16 @@ def batch_pairs(args) -> int:
     if not pairs:
         print("No (audio, text) pairs found.")
         return 1
-    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size)
+    aligner = Aligner(args.device, args.alignment_model, args.language, args.batch_size,
+                      star_frequency=args.star)
     failed = []
     for a, t in pairs:
         print(f"Aligning {a.name} ...")
         try:
             text = read_pair_text(t)
-            low = write_outputs(out_dir, a.stem, a.name, text, aligner.align(a, text), args.granularity or "word")
+            unspoken = unspoken_words(text)
+            low = write_outputs(out_dir, a.stem, a.name, text, aligner.align(a, text, unspoken),
+                                args.granularity or "word", unspoken)
             print(f"  -> {a.stem}_draft.json ({low} low-confidence)")
         except Exception as e:  # noqa: BLE001
             print(f"  [FAILED] {e}")
@@ -533,6 +590,10 @@ def main() -> int:
     ap.add_argument("--batch_size", type=int, default=None,
                     help="30-second pieces per model run (default: 2 on CPU, 8 on GPU; lowered "
                          "automatically if memory runs out)")
+    ap.add_argument("--star", choices=["segment", "edges"], default="segment",
+                    help="segment (default): words not in the script (an instruction read between "
+                         "two parts) are skipped anywhere in the track; edges: only at the start/end "
+                         "(the old behaviour, try it if a track aligns worse)")
     ap.add_argument("--alignment_model", default=DEFAULT_MODEL,
                     help="HF model id or local path (default model is CC-BY-NC-4.0, see GUIDE.md)")
     args = ap.parse_args()

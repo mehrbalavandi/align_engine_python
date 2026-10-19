@@ -41,6 +41,7 @@ class Track:
     audio: Path | None = None  # matched audio file, if any
     note: str = ""             # why no audio was matched (ambiguous / not found)
     has_markers: bool = False  # row[1] already contains [ms] markers
+    not_spoken: set[int] = field(default_factory=set)  # word indices styled "NotSpoken"
 
     @property
     def word_count(self) -> int:
@@ -63,24 +64,58 @@ def _row_caption(row) -> str:
     return "".join(t.text or "" for t in row.iter(W + "t")).strip()
 
 
-def _flatten_row1(row) -> str:
+def _not_spoken_style_ids(z: zipfile.ZipFile) -> set[str]:
+    """Ids of the character styles named "NotSpoken" (any spacing/case), like
+    CustomLayoutGenerator's IsTargetStyle."""
+    try:
+        styles = ET.fromstring(z.read("word/styles.xml"))
+    except KeyError:
+        return set()
+    ids = set()
+    for st in styles.iter(W + "style"):
+        sid = st.get(W + "styleId") or ""
+        name_el = st.find(W + "name")
+        name = name_el.get(W + "val") if name_el is not None else ""
+        if any(v.replace(" ", "").lower() == "notspoken" for v in (sid, name or "")):
+            ids.add(sid)
+    return ids
+
+
+def _flatten_row1(row, not_spoken_ids: set[str] | None = None) -> tuple[str, set[int]]:
+    """(text, indices of the words written entirely in a NotSpoken-styled run)."""
     parts: list[str] = []
+    flags: list[bool] = []  # per character: comes from a NotSpoken run
+    not_spoken_ids = not_spoken_ids or set()
+
+    def add(s: str, ns: bool) -> None:
+        parts.append(s)
+        flags.extend([ns] * len(s))
+
     for cell in row.findall(W + "tc"):
         for para in cell.findall(W + "p"):
             for run in para.findall(W + "r"):
+                rstyle = run.find(W + "rPr/" + W + "rStyle")
+                ns = rstyle is not None and rstyle.get(W + "val") in not_spoken_ids
                 for child in run:
                     if child.tag == W + "t":
-                        parts.append(child.text or "")
+                        add(child.text or "", ns)
                     elif child.tag in (W + "br", W + "tab"):
-                        parts.append(" ")
-            parts.append("\n")
+                        add(" ", False)
+            add("\n", False)
     text = "".join(parts)
-    return text[:-1] if text.endswith("\n") else text
+    if text.endswith("\n"):
+        text = text[:-1]
+    words = set()
+    for i, m in enumerate(re.finditer(r"\S+", text)):
+        if all(flags[m.start():m.end()]):
+            words.add(i)
+    return text, words
 
 
 def read_tracks(docx_path: Path) -> list[Track]:
     with zipfile.ZipFile(docx_path) as z:
         root = ET.fromstring(z.read("word/document.xml"))
+        ns_ids = _not_spoken_style_ids(z)
     tracks: list[Track] = []
     for table in root.iter(W + "tbl"):
         rows = table.findall(W + "tr")
@@ -89,9 +124,9 @@ def read_tracks(docx_path: Path) -> list[Track]:
         name = _row_caption(rows[0])
         if not name:
             continue
-        text = _flatten_row1(rows[1])
+        text, not_spoken = _flatten_row1(rows[1], ns_ids)
         tracks.append(Track(index=len(tracks), name=name, text=text,
-                            has_markers=bool(MARKER_RE.search(text))))
+                            has_markers=bool(MARKER_RE.search(text)), not_spoken=not_spoken))
     _assign_numbers(tracks)
     return tracks
 
