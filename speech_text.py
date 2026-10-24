@@ -8,6 +8,11 @@ spoken ones for the aligner. Standard library only (testable without torch).
      at most 24 characters, none of them a common function word ("The answer is:" is
      spoken, not a label). Same rule as CustomLayoutGenerator's AudioScriptTiming (A-2).
    - any text with the Word character style "NotSpoken" (read in docx_tracks.py).
+   - the automatic number of a numbered (or bulleted) Word list paragraph: Word draws it, so
+     it is not in the runs' text. docx_tracks.py puts LIST_NUMBER_TOKEN ("#") in its place,
+     styled NotSpoken, so the time the reader takes to say "One." belongs to it and not to
+     the first word of the line. AudioMarkerReview and CustomLayoutGenerator use the same
+     token/rule (A-4).
    They get the silence (or unscripted speech) between the words around them, so the
    neighbours keep their real start/end instead of the label stealing time from them.
 
@@ -21,6 +26,10 @@ spoken ones for the aligner. Standard library only (testable without torch).
 from __future__ import annotations
 
 import re
+
+# A-4: stands for a Word list paragraph's automatic number (see docx_tracks._flatten_row1).
+LIST_NUMBER_TOKEN = "#"
+_LEADING_LIST_TOKEN = re.compile(r"^\s*" + re.escape(LIST_NUMBER_TOKEN) + r"(?=\s)")
 
 LABEL_RE = re.compile(r"^\s*[A-Z][\w'’.\-]*(?:[ \t]+[\w'’.\-]+){0,2}:(?=\s|$)")
 MAX_LABEL_LENGTH = 24
@@ -48,10 +57,14 @@ def label_word_indices(text: str) -> set[int]:
     index = 0
     for line in text.split("\n"):
         words = line.split()
-        m = LABEL_RE.match(line)
+        # A-4: "# Man: ..." — the list-number token comes before the label
+        lead = _LEADING_LIST_TOKEN.match(line)
+        body = line[lead.end():] if lead else line
+        first = index + (1 if lead else 0)
+        m = LABEL_RE.match(body)
         if m and is_label(m.group(0)):
             n = len(m.group(0).split())
-            out.update(range(index, index + n))
+            out.update(range(first, first + n))
         index += len(words)
     return out
 

@@ -13,7 +13,9 @@ and AudioMarkerReview (DocxScriptService) read:
 The script text is flattened EXACTLY like AudioMarkerReview's FlattenRow1Text:
 for every cell of row[1], every direct paragraph, every direct run: <w:t> text,
 <w:br>/<w:tab> -> " ", a "\\n" after each paragraph, and one trailing "\\n"
-trimmed. That matters: the review tool refuses a draft whose word count differs
+trimmed. A numbered/bulleted list paragraph (A-4: w:numPr with a numId other than 0, on the
+paragraph itself or, if it has none, on its paragraph style) that has some text starts with
+"# " — the automatic number Word draws — and that "#" is unspoken (like NotSpoken text). That matters: the review tool refuses a draft whose word count differs
 from the word count it reads from the same table.
 """
 
@@ -24,6 +26,8 @@ import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from speech_text import LIST_NUMBER_TOKEN
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma")
@@ -81,11 +85,38 @@ def _not_spoken_style_ids(z: zipfile.ZipFile) -> set[str]:
     return ids
 
 
-def _flatten_row1(row, not_spoken_ids: set[str] | None = None) -> tuple[str, set[int]]:
-    """(text, indices of the words written entirely in a NotSpoken-styled run)."""
+def _numbered_style_ids(z: zipfile.ZipFile) -> set[str]:
+    """A-4: paragraph styles that carry list numbering (w:pPr/w:numPr with numId != 0), like
+    CustomLayoutGenerator's NumberingResolver.ReadNumPr (the style itself, no basedOn chain)."""
+    try:
+        styles = ET.fromstring(z.read("word/styles.xml"))
+    except KeyError:
+        return set()
+    ids = set()
+    for st in styles.iter(W + "style"):
+        num = st.find(W + "pPr/" + W + "numPr/" + W + "numId")
+        if num is not None and (num.get(W + "val") or "0") != "0":
+            ids.add(st.get(W + "styleId") or "")
+    return ids
+
+
+def is_list_paragraph(para, numbered_style_ids: set[str]) -> bool:
+    """A-4: Word draws an automatic number/bullet for this paragraph."""
+    num = para.find(W + "pPr/" + W + "numPr/" + W + "numId")
+    if num is not None:
+        return (num.get(W + "val") or "0") != "0"
+    ps = para.find(W + "pPr/" + W + "pStyle")
+    return ps is not None and ps.get(W + "val") in numbered_style_ids
+
+
+def _flatten_row1(row, not_spoken_ids: set[str] | None = None,
+                  numbered_style_ids: set[str] | None = None) -> tuple[str, set[int]]:
+    """(text, indices of the unspoken words: written entirely in a NotSpoken-styled run, or
+    the A-4 list-number token)."""
     parts: list[str] = []
     flags: list[bool] = []  # per character: comes from a NotSpoken run
     not_spoken_ids = not_spoken_ids or set()
+    numbered_style_ids = numbered_style_ids or set()
 
     def add(s: str, ns: bool) -> None:
         parts.append(s)
@@ -93,6 +124,12 @@ def _flatten_row1(row, not_spoken_ids: set[str] | None = None) -> tuple[str, set
 
     for cell in row.findall(W + "tc"):
         for para in cell.findall(W + "p"):
+            # A-4: Word's automatic list number is not in the runs; "# " stands for it.
+            has_text = any((t.text or "").strip() for r in para.findall(W + "r")
+                           for t in r.findall(W + "t"))
+            if has_text and is_list_paragraph(para, numbered_style_ids):
+                add(LIST_NUMBER_TOKEN, True)
+                add(" ", False)
             for run in para.findall(W + "r"):
                 rstyle = run.find(W + "rPr/" + W + "rStyle")
                 ns = rstyle is not None and rstyle.get(W + "val") in not_spoken_ids
@@ -116,6 +153,7 @@ def read_tracks(docx_path: Path) -> list[Track]:
     with zipfile.ZipFile(docx_path) as z:
         root = ET.fromstring(z.read("word/document.xml"))
         ns_ids = _not_spoken_style_ids(z)
+        num_ids = _numbered_style_ids(z)
     tracks: list[Track] = []
     for table in root.iter(W + "tbl"):
         rows = table.findall(W + "tr")
@@ -124,7 +162,7 @@ def read_tracks(docx_path: Path) -> list[Track]:
         name = _row_caption(rows[0])
         if not name:
             continue
-        text, not_spoken = _flatten_row1(rows[1], ns_ids)
+        text, not_spoken = _flatten_row1(rows[1], ns_ids, num_ids)
         tracks.append(Track(index=len(tracks), name=name, text=text,
                             has_markers=bool(MARKER_RE.search(text)), not_spoken=not_spoken))
     _assign_numbers(tracks)
