@@ -15,19 +15,29 @@ for every cell of row[1], every direct paragraph, every direct run: <w:t> text,
 <w:br>/<w:tab> -> " ", a "\\n" after each paragraph, and one trailing "\\n"
 trimmed. A numbered/bulleted list paragraph (A-4: w:numPr with a numId other than 0, on the
 paragraph itself or, if it has none, on its paragraph style) that has some text starts with
-"# " — the automatic number Word draws — and that "#" is unspoken (like NotSpoken text). That matters: the review tool refuses a draft whose word count differs
-from the word count it reads from the same table.
+one extra word for the automatic number Word draws (it is not in the runs' text):
+  - a NUMERIC number ("1:", "2.", "3") is that number as Word shows it, and it is spoken —
+    the aligner hears "One." and times it like any other word (A-4b);
+  - anything else (bullet, "A:", "iv.") is "#" and unspoken, like NotSpoken text.
+That matters: the review tool refuses a draft whose word count differs from the word count
+it reads from the same table.
+
+Word documents are read from a temporary copy, so a document that is open in Word can be
+read too.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from speech_text import LIST_NUMBER_TOKEN
+from speech_text import LIST_NUMBER_TOKEN, list_number_token
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma")
@@ -85,22 +95,23 @@ def _not_spoken_style_ids(z: zipfile.ZipFile) -> set[str]:
     return ids
 
 
-def _numbered_style_ids(z: zipfile.ZipFile) -> set[str]:
+def _numbered_style_ids(z: zipfile.ZipFile) -> dict[str, str]:
     """A-4: paragraph styles that carry list numbering (w:pPr/w:numPr with numId != 0), like
-    CustomLayoutGenerator's NumberingResolver.ReadNumPr (the style itself, no basedOn chain)."""
+    CustomLayoutGenerator's NumberingResolver.ReadNumPr (the style itself, no basedOn chain).
+    styleId -> numId."""
     try:
         styles = ET.fromstring(z.read("word/styles.xml"))
     except KeyError:
-        return set()
-    ids = set()
+        return {}
+    ids: dict[str, str] = {}
     for st in styles.iter(W + "style"):
         num = st.find(W + "pPr/" + W + "numPr/" + W + "numId")
         if num is not None and (num.get(W + "val") or "0") != "0":
-            ids.add(st.get(W + "styleId") or "")
+            ids[st.get(W + "styleId") or ""] = num.get(W + "val")
     return ids
 
 
-def is_list_paragraph(para, numbered_style_ids: set[str]) -> bool:
+def is_list_paragraph(para, numbered_style_ids) -> bool:
     """A-4: Word draws an automatic number/bullet for this paragraph."""
     num = para.find(W + "pPr/" + W + "numPr/" + W + "numId")
     if num is not None:
@@ -109,14 +120,135 @@ def is_list_paragraph(para, numbered_style_ids: set[str]) -> bool:
     return ps is not None and ps.get(W + "val") in numbered_style_ids
 
 
+class ListNumbering:
+    """A-4b: the number Word draws for each list paragraph, like CustomLayoutGenerator's
+    NumberingResolver: counters per numId, w:lvlOverride/w:startOverride, deeper levels
+    restart, w:lvlText ("%1:", "%1.%2") and w:numFmt. Call marker() for EVERY list paragraph
+    in document order (empty ones too — Word counts them)."""
+
+    _BULLETS = ["\u2022", "\u25E6", "\u25AA", "\u2023", "\u00B7"]
+
+    def __init__(self, z: zipfile.ZipFile, numbered_style_ids: dict[str, str]):
+        self._abs_by_num: dict[str, ET.Element] = {}
+        self._start_override: dict[str, dict[int, int]] = {}
+        self._counters: dict[str, dict[int, int]] = {}
+        self._style_num = numbered_style_ids
+        try:
+            num = ET.fromstring(z.read("word/numbering.xml"))
+        except KeyError:
+            return
+        abs_by_id = {a.get(W + "abstractNumId"): a for a in num.findall(W + "abstractNum")}
+        for n in num.findall(W + "num"):
+            nid = n.get(W + "numId")
+            ref = n.find(W + "abstractNumId")
+            if nid is None or ref is None:
+                continue
+            a = abs_by_id.get(ref.get(W + "val"))
+            if a is not None:
+                self._abs_by_num[nid] = a
+            for ov in n.findall(W + "lvlOverride"):
+                so = ov.find(W + "startOverride")
+                if so is not None and ov.get(W + "ilvl") is not None:
+                    self._start_override.setdefault(nid, {})[int(ov.get(W + "ilvl"))] = int(so.get(W + "val") or 1)
+
+    def num_pr(self, para) -> tuple[str, int] | None:
+        """(numId, level): the paragraph's own w:numPr, else its style's (level 0)."""
+        np_ = para.find(W + "pPr/" + W + "numPr")
+        nid = None
+        level = 0
+        if np_ is not None:
+            n = np_.find(W + "numId")
+            nid = n.get(W + "val") if n is not None else None
+            lv = np_.find(W + "ilvl")
+            if lv is not None:
+                level = int(lv.get(W + "val") or 0)
+        if nid is None:
+            ps = para.find(W + "pPr/" + W + "pStyle")
+            if ps is not None:
+                nid = self._style_num.get(ps.get(W + "val") or "")
+        if nid is None or nid == "0":
+            return None
+        return nid, level
+
+    def _lvl(self, a: ET.Element, level: int) -> ET.Element | None:
+        for lv in a.findall(W + "lvl"):
+            if int(lv.get(W + "ilvl") or 0) == level:
+                return lv
+        return None
+
+    def _val(self, lv: ET.Element | None, tag: str) -> str | None:
+        el = lv.find(W + tag) if lv is not None else None
+        return el.get(W + "val") if el is not None else None
+
+    def _start(self, nid: str, a: ET.Element, level: int) -> int:
+        so = self._start_override.get(nid, {})
+        if level in so:
+            return so[level]
+        v = self._val(self._lvl(a, level), "start")
+        return int(v) if v else 1
+
+    @staticmethod
+    def _format(n: int, fmt: str | None) -> str:
+        n = max(n, 1)
+        if fmt in ("lowerLetter", "upperLetter"):
+            s = ""
+            while n > 0:
+                n -= 1
+                s = chr(ord("a") + n % 26) + s
+                n //= 26
+            return s.upper() if fmt == "upperLetter" else s
+        if fmt in ("lowerRoman", "upperRoman"):
+            vals = [(1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+                    (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]
+            s = ""
+            for v, sym in vals:
+                while n >= v:
+                    s += sym
+                    n -= v
+            return s.lower() if fmt == "lowerRoman" else s
+        return str(n)
+
+    def marker(self, para) -> str | None:
+        """Advances the counters; the marker text ("1:", "a)", "\u2022") or None (no list)."""
+        np_ = self.num_pr(para)
+        if np_ is None:
+            return None
+        nid, level = np_
+        a = self._abs_by_num.get(nid)
+        if a is None:
+            return None
+        counters = self._counters.setdefault(nid, {})
+        if level not in counters:
+            counters[level] = self._start(nid, a, level) - 1
+        counters[level] += 1
+        for deeper in [k for k in counters if k > level]:
+            counters[deeper] = self._start(nid, a, deeper) - 1
+        lv = self._lvl(a, level)
+        fmt = self._val(lv, "numFmt") or "decimal"
+        if fmt == "bullet":
+            return self._BULLETS[level % len(self._BULLETS)]
+        template = self._val(lv, "lvlText")
+        if template is None:
+            template = f"%{level + 1}."
+
+        def sub(m: re.Match) -> str:
+            ref = int(m.group(1)) - 1
+            v = counters.get(ref, self._start(nid, a, ref))
+            return self._format(v, self._val(self._lvl(a, ref), "numFmt") or "decimal")
+        return re.sub(r"%(\d)", sub, template)
+
+
 def _flatten_row1(row, not_spoken_ids: set[str] | None = None,
-                  numbered_style_ids: set[str] | None = None) -> tuple[str, set[int]]:
+                  numbered_style_ids: set[str] | dict[str, str] | None = None,
+                  list_markers: dict[int, str] | None = None) -> tuple[str, set[int]]:
     """(text, indices of the unspoken words: written entirely in a NotSpoken-styled run, or
-    the A-4 list-number token)."""
+    the A-4 "#" token of a non-numeric list number). list_markers: id(paragraph) -> the
+    number Word draws (ListNumbering.marker); a list paragraph missing from it gets "#"."""
     parts: list[str] = []
     flags: list[bool] = []  # per character: comes from a NotSpoken run
     not_spoken_ids = not_spoken_ids or set()
     numbered_style_ids = numbered_style_ids or set()
+    list_markers = list_markers or {}
 
     def add(s: str, ns: bool) -> None:
         parts.append(s)
@@ -124,11 +256,13 @@ def _flatten_row1(row, not_spoken_ids: set[str] | None = None,
 
     for cell in row.findall(W + "tc"):
         for para in cell.findall(W + "p"):
-            # A-4: Word's automatic list number is not in the runs; "# " stands for it.
+            # A-4: Word's automatic list number is not in the runs; one word stands for it:
+            # the number itself when it is numeric (spoken, A-4b), else "#" (unspoken).
             has_text = any((t.text or "").strip() for r in para.findall(W + "r")
                            for t in r.findall(W + "t"))
             if has_text and is_list_paragraph(para, numbered_style_ids):
-                add(LIST_NUMBER_TOKEN, True)
+                token = list_number_token(list_markers.get(id(para)))
+                add(token, token == LIST_NUMBER_TOKEN)
                 add(" ", False)
             for run in para.findall(W + "r"):
                 rstyle = run.find(W + "rPr/" + W + "rStyle")
@@ -149,11 +283,34 @@ def _flatten_row1(row, not_spoken_ids: set[str] | None = None,
     return text, words
 
 
+def _copy_to_temp(docx_path: Path) -> Path:
+    """// ساخت فایل موقت — like CustomLayoutGenerator and AudioMarkerReview: read a temporary
+    copy, so a document that is open (and locked) in Word can still be read."""
+    fd, tmp = tempfile.mkstemp(prefix="align_", suffix=".docx")
+    os.close(fd)
+    shutil.copyfile(docx_path, tmp)
+    return Path(tmp)
+
+
 def read_tracks(docx_path: Path) -> list[Track]:
-    with zipfile.ZipFile(docx_path) as z:
-        root = ET.fromstring(z.read("word/document.xml"))
-        ns_ids = _not_spoken_style_ids(z)
-        num_ids = _numbered_style_ids(z)
+    tmp = _copy_to_temp(Path(docx_path))
+    try:
+        with zipfile.ZipFile(tmp) as z:
+            root = ET.fromstring(z.read("word/document.xml"))
+            ns_ids = _not_spoken_style_ids(z)
+            num_ids = _numbered_style_ids(z)
+            numbering = ListNumbering(z, num_ids)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    # A-4b: the numbers Word draws, counted over the whole document in order
+    list_markers: dict[int, str] = {}
+    for para in root.iter(W + "p"):
+        m = numbering.marker(para)
+        if m is not None:
+            list_markers[id(para)] = m
     tracks: list[Track] = []
     for table in root.iter(W + "tbl"):
         rows = table.findall(W + "tr")
@@ -162,7 +319,7 @@ def read_tracks(docx_path: Path) -> list[Track]:
         name = _row_caption(rows[0])
         if not name:
             continue
-        text, not_spoken = _flatten_row1(rows[1], ns_ids, num_ids)
+        text, not_spoken = _flatten_row1(rows[1], ns_ids, num_ids, list_markers)
         tracks.append(Track(index=len(tracks), name=name, text=text,
                             has_markers=bool(MARKER_RE.search(text)), not_spoken=not_spoken))
     _assign_numbers(tracks)

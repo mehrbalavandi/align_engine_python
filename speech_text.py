@@ -8,11 +8,12 @@ spoken ones for the aligner. Standard library only (testable without torch).
      at most 24 characters, none of them a common function word ("The answer is:" is
      spoken, not a label). Same rule as CustomLayoutGenerator's AudioScriptTiming (A-2).
    - any text with the Word character style "NotSpoken" (read in docx_tracks.py).
-   - the automatic number of a numbered (or bulleted) Word list paragraph: Word draws it, so
-     it is not in the runs' text. docx_tracks.py puts LIST_NUMBER_TOKEN ("#") in its place,
-     styled NotSpoken, so the time the reader takes to say "One." belongs to it and not to
-     the first word of the line. AudioMarkerReview and CustomLayoutGenerator use the same
-     token/rule (A-4).
+   - the automatic number of a bulleted Word list paragraph, or of a numbered one whose
+     number is not numeric ("A:", "iv."): Word draws it, so it is not in the runs' text.
+     docx_tracks.py puts LIST_NUMBER_TOKEN ("#") in its place, styled NotSpoken (A-4).
+     A NUMERIC list number ("1:", "2.", "3") is spoken instead: docx_tracks.py writes the
+     number itself and the aligner hears "One." (A-4b, list_number_token).
+     AudioMarkerReview and CustomLayoutGenerator use the same token/rule.
    They get the silence (or unscripted speech) between the words around them, so the
    neighbours keep their real start/end instead of the label stealing time from them.
 
@@ -27,9 +28,22 @@ from __future__ import annotations
 
 import re
 
-# A-4: stands for a Word list paragraph's automatic number (see docx_tracks._flatten_row1).
+# A-4: stands for a Word list paragraph's automatic number when it is not numeric (see
+# docx_tracks._flatten_row1); a numeric one is written as the number itself (A-4b).
 LIST_NUMBER_TOKEN = "#"
-_LEADING_LIST_TOKEN = re.compile(r"^\s*" + re.escape(LIST_NUMBER_TOKEN) + r"(?=\s)")
+# A list-number word at the start of a line, before a speaker label: "# Man: ...", "1: Man: ..."
+_LEADING_LIST_TOKEN = re.compile(r"^\s*(?:" + re.escape(LIST_NUMBER_TOKEN) + r"|\d+[.:)]?)(?=\s)")
+
+
+def list_number_token(marker: str | None) -> str:
+    """A-4b: the word that stands for a Word list paragraph's automatic number.
+    Numeric ("1:", "2.", "3", "1.2") -> the number without spaces, spoken like any word;
+    anything else (bullet, "A:", "iv.", unknown) -> LIST_NUMBER_TOKEN, unspoken."""
+    if marker and any(ch.isdigit() for ch in marker):
+        token = re.sub(r"\s+", "", marker)
+        if token:
+            return token
+    return LIST_NUMBER_TOKEN
 
 LABEL_RE = re.compile(r"^\s*[A-Z][\w'’.\-]*(?:[ \t]+[\w'’.\-]+){0,2}:(?=\s|$)")
 MAX_LABEL_LENGTH = 24
